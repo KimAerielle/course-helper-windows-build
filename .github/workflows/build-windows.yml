@@ -1,0 +1,113 @@
+name: Build Course Helper for Windows
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-windows.yml'
+      - 'patches/**'
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Upstream branch, tag, or commit to build
+        required: true
+        default: 9df279e8558975777c9c686f5b07bc174ef6054f
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: source
+    steps:
+      - name: Check out upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: AneryCoft/course_helper
+          ref: ${{ inputs.source_ref || '9df279e8558975777c9c686f5b07bc174ef6054f' }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.8'
+          channel: stable
+          cache: true
+
+      - name: Record source and toolchain
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git rev-parse HEAD | Set-Content ../source-commit.txt
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source commit.' }
+          flutter --version
+          if ($LASTEXITCODE -ne 0) { throw 'Flutter is unavailable.' }
+          flutter doctor -v
+
+      - name: Generate Windows runner
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter config --enable-windows-desktop
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot enable Windows desktop.' }
+          if (-not (Test-Path windows/CMakeLists.txt)) {
+            flutter create --platforms=windows --project-name course_helper --no-pub .
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot generate Windows runner.' }
+          }
+
+      - name: Resolve dependencies
+        run: |
+          flutter pub get 2>&1 | Tee-Object ../dependency-resolution.log
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency resolution failed.' }
+
+      - name: Compile Windows release
+        run: |
+          flutter build windows --release 2>&1 | Tee-Object ../windows-build.log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows release compilation failed.' }
+
+      - name: Package complete application and matching source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'build/windows/x64/runner/Release'
+          if (-not (Test-Path "$release/course_helper.exe")) {
+            throw 'The expected Windows executable is missing.'
+          }
+          if (-not (Test-Path "$release/flutter_windows.dll")) {
+            throw 'The Flutter runtime is missing.'
+          }
+          if (-not (Test-Path "$release/data")) {
+            throw 'The application data directory is missing.'
+          }
+          New-Item -ItemType Directory ../output -Force | Out-Null
+          Copy-Item LICENSE "$release/LICENSE.txt"
+          Copy-Item ../source-commit.txt "$release/source-commit.txt"
+          Compress-Archive -Path "$release/*" -DestinationPath ../output/CourseHelper-Windows-x64.zip
+          tar.exe --exclude=.git --exclude=.dart_tool --exclude=build --exclude=windows/flutter/ephemeral -czf ../output/CourseHelper-Corresponding-Source.tar.gz .
+          if ($LASTEXITCODE -ne 0) { throw 'Source archive creation failed.' }
+          Get-FileHash ../output/* -Algorithm SHA256 |
+            ForEach-Object { '{0}  {1}' -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } |
+            Set-Content ../output/SHA256SUMS.txt
+
+      - name: Upload Windows application and source
+        uses: actions/upload-artifact@v4
+        with:
+          name: CourseHelper-Windows-x64
+          path: output/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CourseHelper-Windows-build-diagnostics
+          path: |
+            dependency-resolution.log
+            windows-build.log
+            source-commit.txt
+          if-no-files-found: warn
+          retention-days: 14
