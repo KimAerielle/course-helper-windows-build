@@ -59,10 +59,108 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Cannot generate Windows runner.' }
           }
 
+
+      - name: Prepare Windows startup compatibility and smoke test
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = (Get-Location).Path
+          function Replace-RequiredSource {
+            param([string]$RelativePath, [string]$Before, [string]$After)
+            $target = Join-Path $repoRoot $RelativePath
+            $text = [IO.File]::ReadAllText($target)
+            if (-not $text.Contains($Before)) {
+              throw "The pinned source fragment was not found in $RelativePath."
+            }
+            [IO.File]::WriteAllText($target, $text.Replace($Before, $After), [Text.UTF8Encoding]::new($false))
+          }
+          
+          $imStartup = @'
+            if (Platform.isWindows) {
+              logger.w('The mobile IM SDK is unavailable on Windows.');
+            } else {
+              await EasemobIM().initialize();
+            }
+          '@
+          Replace-RequiredSource 'lib/main.dart' '  await EasemobIM().initialize();' $imStartup
+          
+          $windowsNotifications = @'
+          settings: InitializationSettings(
+                  android: androidSettings,
+                  iOS: iosSettings,
+                  windows: WindowsInitializationSettings(
+                    appName: '课程助手',
+                    appUserModelId: 'com.anerycoft.course_helper',
+                    guid: '8b6e172b-8524-43c6-9959-f4a83cbaf57b',
+                  ),
+                ),
+          '@
+          Replace-RequiredSource 'lib/push/notification.dart' 'settings: const InitializationSettings(android: androidSettings, iOS: iosSettings),' $windowsNotifications
+          
+          $testDependency = "dev_dependencies:" + [Environment]::NewLine + "  integration_test:" + [Environment]::NewLine + "    sdk: flutter"
+          Replace-RequiredSource 'pubspec.yaml' 'dev_dependencies:' $testDependency
+          
+          $smokeTest = @'
+          import 'package:flutter/material.dart';
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:integration_test/integration_test.dart';
+          import 'package:course_helper/main.dart' as app;
+          import 'package:course_helper/pages/accounts.dart';
+          
+          void main() {
+            IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+          
+            testWidgets('Windows starts and opens account management', (tester) async {
+              final originalErrorHandler = FlutterError.onError;
+              addTearDown(() {
+                FlutterError.onError = originalErrorHandler;
+              });
+          
+              await app.main();
+              FlutterError.onError = originalErrorHandler;
+              await tester.pumpAndSettle(
+                const Duration(milliseconds: 100),
+                EnginePhase.sendSemanticsUpdate,
+                const Duration(seconds: 30),
+              );
+              expect(find.byType(app.MyApp), findsOneWidget);
+              expect(find.byType(BottomNavigationBar), findsOneWidget);
+          
+              final cancel = find.widgetWithText(TextButton, '取消');
+              if (cancel.evaluate().isNotEmpty) {
+                await tester.tap(cancel.first);
+                await tester.pumpAndSettle();
+              }
+          
+              await tester.tap(find.byIcon(Icons.account_circle));
+              await tester.pumpAndSettle();
+              final navigation = tester.widget<BottomNavigationBar>(
+                find.byType(BottomNavigationBar),
+              );
+              expect(navigation.currentIndex, 1);
+              expect(find.byType(AccountsPage), findsOneWidget);
+              expect(tester.takeException(), isNull);
+          
+              await tester.pumpWidget(const SizedBox.shrink());
+              await tester.pumpAndSettle();
+            });
+          }
+          '@
+          $testDirectory = Join-Path $repoRoot 'integration_test'
+          [IO.Directory]::CreateDirectory($testDirectory) | Out-Null
+          [IO.File]::WriteAllText((Join-Path $testDirectory 'windows_smoke_test.dart'), $smokeTest, [Text.UTF8Encoding]::new($false))
+          Write-Host 'Prepared Windows notification settings, mobile IM guard, and desktop startup check.'
+          
+
       - name: Resolve dependencies
         run: |
           flutter pub get 2>&1 | Tee-Object ../dependency-resolution.log
           if ($LASTEXITCODE -ne 0) { throw 'Dependency resolution failed.' }
+
+      - name: Verify Windows startup and account navigation
+        timeout-minutes: 8
+        run: |
+          flutter test integration_test/windows_smoke_test.dart -d windows --reporter expanded 2>&1 | Tee-Object ../windows-startup-test.log
+          if ($LASTEXITCODE -ne 0) { throw 'Windows startup verification failed.' }
 
       - name: Compile Windows release
         run: |
@@ -108,6 +206,7 @@ jobs:
           path: |
             dependency-resolution.log
             windows-build.log
+            windows-startup-test.log
             source-commit.txt
           if-no-files-found: warn
           retention-days: 14
