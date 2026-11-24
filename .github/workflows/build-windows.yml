@@ -115,7 +115,8 @@ jobs:
                 FlutterError.onError = originalErrorHandler;
               });
           
-              await app.main();
+              // The upstream async entry point has a void return type.
+              await (app.main as dynamic)();
               FlutterError.onError = originalErrorHandler;
               await tester.pumpAndSettle(
                 const Duration(milliseconds: 100),
